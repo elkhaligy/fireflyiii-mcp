@@ -74,11 +74,15 @@ export async function createRecurrence(
   if (params.tags !== undefined) transaction.tags = params.tags;
   if (params.transaction_notes !== undefined) transaction.notes = params.transaction_notes;
 
+  // Firefly III rejects a recurrence that has both an end date and a count, and a `repeat_until: null`
+  // counts as having one, so it is only sent when there is no count.
+  if (params.nr_of_repetitions !== undefined && params.repeat_until != null) {
+    throw new Error('Pass either repeat_until or nr_of_repetitions, not both.');
+  }
   const body: Record<string, unknown> = {
     type: params.type,
     title: params.title,
     first_date: params.first_date,
-    repeat_until: params.repeat_until ?? null,
     apply_rules: params.apply_rules ?? true,
     active: params.active ?? true,
     repetitions: [repetition],
@@ -87,6 +91,7 @@ export async function createRecurrence(
   if (params.description !== undefined) body.description = params.description;
   if (params.notes !== undefined) body.notes = params.notes;
   if (params.nr_of_repetitions !== undefined) body.nr_of_repetitions = params.nr_of_repetitions;
+  else body.repeat_until = params.repeat_until ?? null;
 
   const response = await client.post<JsonApiSingleResponse>('/recurrences', body);
   return unwrapSingle(response);
@@ -128,6 +133,9 @@ export async function updateRecurrence(
     throw new Error(
       'Pass foreign_amount and foreign_currency_code together, even if one of them is unchanged: Firefly III rejects a recurrence update that sends only one.',
     );
+  }
+  if (params.nr_of_repetitions !== undefined && params.repeat_until != null) {
+    throw new Error('Pass either repeat_until or nr_of_repetitions, not both.');
   }
   const body: Record<string, unknown> = {};
   if (params.type !== undefined) body.type = params.type;
@@ -246,8 +254,7 @@ export function registerRecurringTools(server: McpServer, client: FireflyClient)
     'create_recurring',
     {
       title: 'Create Recurring Transaction',
-      description:
-        'Create a new recurring transaction in Firefly III. Use get_accounts to find source and destination account IDs. Use get_categories to find category IDs.',
+      description: `Create a new recurring transaction in Firefly III: a schedule that creates a real transaction on every occurrence (unlike a bill/subscription, which only tracks expected payments). The transactions are created by Firefly III's daily cron job, so it must be running on the server; trigger_recurrence creates one immediately. Schedules: repeat_type monthly + repeat_moment "15" = the 15th of every month; add skip 2 for quarterly (every 3 months) or skip 5 for every 6 months; weekly + skip 1 = every other week. End with repeat_until (a date) or nr_of_repetitions (a count), not both; nr_of_repetitions 1 schedules a one-time future transaction. Example — monthly certificate interest until maturity: {"type": "deposit", "title": "Interest - NBE Cert A", "first_date": "2026-11-15", "repeat_until": "2029-08-15", "repeat_type": "monthly", "repeat_moment": "15", "amount": "1250.00", "transaction_description": "Interest - NBE Cert A", "source_id": "33", "destination_id": "1"}. Use get_accounts to find account IDs and get_categories to find category IDs.`,
       inputSchema: {
         type: z.enum(['withdrawal', 'deposit', 'transfer']).describe('Transaction type for all generated transactions'),
         title: z.string().describe('Name of the recurring transaction'),
@@ -272,7 +279,15 @@ export function registerRecurringTools(server: McpServer, client: FireflyClient)
           .describe(
             'Repetition moment: empty string for daily; 1–7 (Mon–Sun) for weekly; 1–31 for monthly; "week,day" e.g. "2,3" for ndom (2nd Wednesday); YYYY-MM-DD for yearly (year value ignored)',
           ),
-        skip: z.number().int().min(0).optional().describe('Skip every N occurrences (0 = none, 1 = every other)'),
+        skip: z
+          .number()
+          .int()
+          .min(0)
+          .max(31)
+          .optional()
+          .describe(
+            'Periods to skip between occurrences: 0 = every period, 1 = every other, 2 with monthly = quarterly, 5 with monthly = every 6 months',
+          ),
         weekend: z
           .number()
           .int()
@@ -323,7 +338,13 @@ export function registerRecurringTools(server: McpServer, client: FireflyClient)
           .optional()
           .describe('Repetition frequency'),
         repeat_moment: z.string().optional().describe('Repetition moment (see create_recurring for format details)'),
-        skip: z.number().int().min(0).optional().describe('Skip every N occurrences'),
+        skip: z
+          .number()
+          .int()
+          .min(0)
+          .max(31)
+          .optional()
+          .describe('Periods to skip between occurrences (see create_recurring)'),
         weekend: z
           .number()
           .int()

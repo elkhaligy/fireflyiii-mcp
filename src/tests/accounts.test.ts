@@ -397,3 +397,56 @@ describe('accounts autocomplete completions', () => {
     expect(client.get).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('asset account fields', () => {
+  it('creates an account with number, virtual balance and active flag', async () => {
+    mockClient.post = vi.fn().mockResolvedValueOnce(accountSingleFixture);
+    await createAccount(mockClient, {
+      name: 'NBE Cert A',
+      type: 'asset',
+      account_role: 'savingAsset',
+      account_number: '1234',
+      virtual_balance: '0',
+      active: true,
+    });
+    expect(mockClient.post).toHaveBeenCalledWith('/accounts', {
+      name: 'NBE Cert A',
+      type: 'asset',
+      account_role: 'savingAsset',
+      account_number: '1234',
+      virtual_balance: '0',
+      active: true,
+    });
+  });
+
+  it('changes the role to a credit card together with its billing settings', async () => {
+    mockClient.put = vi.fn().mockResolvedValueOnce(accountSingleFixture);
+    await updateAccount(mockClient, '3', {
+      account_role: 'ccAsset',
+      credit_card_type: 'monthlyFull',
+      monthly_payment_date: '2026-11-05',
+    });
+    expect(mockClient.put).toHaveBeenCalledWith('/accounts/3', {
+      account_role: 'ccAsset',
+      credit_card_type: 'monthlyFull',
+      monthly_payment_date: '2026-11-05',
+    });
+  });
+
+  it('exposes the new fields on both tools', () => {
+    const { server, toolConfigs } = createMockServer();
+    registerAccountTools(server, mockClient);
+    for (const tool of ['create_account', 'update_account']) {
+      const shape = toolConfigs.get(tool)?.inputSchema ?? {};
+      for (const field of [
+        'account_number',
+        'virtual_balance',
+        'credit_card_type',
+        'monthly_payment_date',
+        'account_role',
+      ]) {
+        expect(shape, `${tool}.${field}`).toHaveProperty(field);
+      }
+    }
+  });
+});

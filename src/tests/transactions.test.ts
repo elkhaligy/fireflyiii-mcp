@@ -759,3 +759,322 @@ describe('foreign currency guidance', () => {
     }
   });
 });
+
+/** A transaction group whose splits carry type, date and accounts, as Firefly III returns them. */
+function accountGroupFixture(
+  id: string,
+  type: string,
+  splits: Array<[journalId: string, description: string, amount: string, sourceId: string, destinationId: string]>,
+  title: string | null,
+) {
+  return {
+    data: {
+      id,
+      type: 'transactions',
+      attributes: {
+        group_title: title,
+        transactions: splits.map(([transaction_journal_id, description, amount, source_id, destination_id]) => ({
+          transaction_journal_id,
+          type,
+          date: '2026-10-23T00:00:00+03:00',
+          description,
+          amount,
+          source_id,
+          destination_id,
+        })),
+      },
+      links: {},
+    },
+  };
+}
+
+describe('createSplitTransaction per-split accounts', () => {
+  it('lets each withdrawal split set its own destination, inheriting the shared source', async () => {
+    mockClient.post = vi.fn().mockResolvedValueOnce(writeSingleFixture);
+    await createSplitTransaction(mockClient, {
+      type: 'withdrawal',
+      date: '2026-10-23',
+      source_id: '3',
+      group_title: 'Amazon order',
+      splits: [
+        { amount: '1000.00', description: 'My part', destination_id: '41', category_name: 'Electronics' },
+        { amount: '1000.00', description: "Mody's part", destination_id: '12', bill_id: '4', internal_reference: 'R1' },
+      ],
+    });
+    const body = vi.mocked(mockClient.post).mock.calls[0][1] as { transactions: Array<Record<string, unknown>> };
+    expect(body.transactions).toEqual([
+      {
+        type: 'withdrawal',
+        date: '2026-10-23',
+        source_id: '3',
+        destination_id: '41',
+        amount: '1000.00',
+        description: 'My part',
+        category_name: 'Electronics',
+      },
+      {
+        type: 'withdrawal',
+        date: '2026-10-23',
+        source_id: '3',
+        destination_id: '12',
+        amount: '1000.00',
+        description: "Mody's part",
+        bill_id: '4',
+        internal_reference: 'R1',
+      },
+    ]);
+  });
+
+  it('defaults group_title to the first split description', async () => {
+    mockClient.post = vi.fn().mockResolvedValueOnce(writeSingleFixture);
+    await createSplitTransaction(mockClient, {
+      type: 'deposit',
+      date: '2026-10-23',
+      destination_id: '1',
+      splits: [
+        { amount: '1.00', description: 'first', source_id: '6' },
+        { amount: '2.00', description: 'second', source_id: '7' },
+      ],
+    });
+    expect(vi.mocked(mockClient.post).mock.calls[0][1]).toMatchObject({ group_title: 'first' });
+  });
+
+  it.each([
+    ['withdrawal', { source_id: '7', destination_id: '4' }, /share one source account.*3, 7/],
+    ['deposit', { destination_id: '9', source_id: '6' }, /share one destination account.*1, 9/],
+    ['transfer', { destination_id: '9' }, /share both.*destination_id values: 1, 9/],
+  ] as const)(
+    'refuses a %s whose splits break the shared-account rule, before calling Firefly',
+    async (type, second, error) => {
+      mockClient.post = vi.fn();
+      await expect(
+        createSplitTransaction(mockClient, {
+          type,
+          date: '2026-10-23',
+          source_id: '3',
+          destination_id: '1',
+          group_title: 'g',
+          splits: [
+            { amount: '1.00', description: 'a' },
+            { amount: '1.00', description: 'b', ...second },
+          ],
+        }),
+      ).rejects.toThrow(error);
+      expect(mockClient.post).not.toHaveBeenCalled();
+    },
+  );
+
+  it('returns a duplicate result instead of an error when Firefly III refuses a duplicate', async () => {
+    mockClient.post = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new FireflyError(
+          422,
+          'https://ff/api/v1/transactions',
+          '{"message":"Duplicate of transaction #3.","errors":{"transactions.0.description":["Duplicate of transaction #3."]}}',
+        ),
+      );
+    const result = await createSplitTransaction(mockClient, {
+      type: 'withdrawal',
+      date: '2026-10-23',
+      source_id: '3',
+      error_if_duplicate_hash: true,
+      splits: [
+        { amount: '1.00', description: 'a' },
+        { amount: '1.00', description: 'b' },
+      ],
+    });
+    expect(result).toMatchObject({ duplicate: true, created: false, existing_transaction_id: '3' });
+    expect(vi.mocked(mockClient.post).mock.calls[0][1]).toMatchObject({ error_if_duplicate_hash: true });
+  });
+});
+
+describe('createTransaction new fields', () => {
+  it('sends bill, reference fields and write options', async () => {
+    mockClient.post = vi.fn().mockResolvedValueOnce(writeSingleFixture);
+    await createTransaction(mockClient, {
+      type: 'withdrawal',
+      date: '2026-10-23',
+      amount: '912.36',
+      description: 'OVHcloud',
+      source_id: '3',
+      bill_id: '2',
+      external_id: 'sms-1',
+      internal_reference: 'ABC123',
+      external_url: 'https://example.test/x',
+      error_if_duplicate_hash: true,
+      apply_rules: false,
+    });
+    expect(mockClient.post).toHaveBeenCalledWith('/transactions', {
+      apply_rules: false,
+      fire_webhooks: true,
+      error_if_duplicate_hash: true,
+      transactions: [
+        {
+          type: 'withdrawal',
+          date: '2026-10-23',
+          amount: '912.36',
+          description: 'OVHcloud',
+          source_id: '3',
+          bill_id: '2',
+          external_id: 'sms-1',
+          internal_reference: 'ABC123',
+          external_url: 'https://example.test/x',
+        },
+      ],
+    });
+  });
+
+  it('rethrows a 422 that is not a duplicate', async () => {
+    mockClient.post = vi
+      .fn()
+      .mockRejectedValueOnce(new FireflyError(422, 'https://ff/api/v1/transactions', '{"errors":{"amount":["bad"]}}'));
+    await expect(
+      createTransaction(mockClient, { type: 'withdrawal', date: '2026-10-23', amount: 'x', description: 'd' }),
+    ).rejects.toBeInstanceOf(FireflyError);
+  });
+});
+
+describe('updateTransaction splits', () => {
+  const plain = () => accountGroupFixture('57', 'withdrawal', [['221', 'Amazon order', '2000.00', '3', '41']], null);
+  const twoSplits = () =>
+    accountGroupFixture(
+      '57',
+      'withdrawal',
+      [
+        ['221', 'My part', '1000.00', '3', '41'],
+        ['222', "Mody's part", '1000.00', '3', '12'],
+      ],
+      'Amazon order',
+    );
+
+  it('splits a plain charge: edits the existing split and adds one that inherits type, date and source', async () => {
+    mockClient.get = vi.fn().mockResolvedValueOnce(plain());
+    mockClient.put = vi.fn().mockResolvedValueOnce(writeSingleFixture);
+    await updateTransaction(mockClient, '57', {
+      group_title: 'Amazon order',
+      splits: [
+        { transaction_journal_id: '221', amount: '1000.00' },
+        { amount: '1000.00', description: "Mody's part", destination_id: '12', category_name: "Mody's Purchases" },
+      ],
+    });
+    expect(mockClient.put).toHaveBeenCalledWith('/transactions/57', {
+      apply_rules: true,
+      fire_webhooks: true,
+      group_title: 'Amazon order',
+      transactions: [
+        { transaction_journal_id: '221', amount: '1000.00' },
+        {
+          type: 'withdrawal',
+          date: '2026-10-23T00:00:00+03:00',
+          source_id: '3',
+          amount: '1000.00',
+          description: "Mody's part",
+          destination_id: '12',
+          category_name: "Mody's Purchases",
+        },
+      ],
+    });
+  });
+
+  it('changes one split of two and keeps the other by id', async () => {
+    mockClient.get = vi.fn().mockResolvedValueOnce(twoSplits());
+    mockClient.put = vi.fn().mockResolvedValueOnce(writeSingleFixture);
+    await updateTransaction(mockClient, '57', { splits: [{ transaction_journal_id: '222', category_name: 'Family' }] });
+    const body = vi.mocked(mockClient.put).mock.calls[0][1] as Record<string, unknown>;
+    expect(body.transactions).toEqual([
+      { transaction_journal_id: '221' },
+      { transaction_journal_id: '222', category_name: 'Family' },
+    ]);
+    expect(body.group_title).toBe('Amazon order');
+  });
+
+  it('removes only the splits listed in remove_journal_ids', async () => {
+    mockClient.get = vi.fn().mockResolvedValueOnce(twoSplits());
+    mockClient.put = vi.fn().mockResolvedValueOnce(writeSingleFixture);
+    await updateTransaction(mockClient, '57', {
+      remove_journal_ids: ['222'],
+      splits: [{ transaction_journal_id: '221', amount: '2000.00' }],
+    });
+    expect(vi.mocked(mockClient.put).mock.calls[0][1]).toEqual({
+      apply_rules: true,
+      fire_webhooks: true,
+      transactions: [{ transaction_journal_id: '221', amount: '2000.00' }],
+    });
+  });
+
+  it('refuses to remove every split', async () => {
+    mockClient.get = vi.fn().mockResolvedValueOnce(twoSplits());
+    mockClient.put = vi.fn();
+    await expect(updateTransaction(mockClient, '57', { remove_journal_ids: ['221', '222'] })).rejects.toThrow(
+      /delete_transaction/,
+    );
+    expect(mockClient.put).not.toHaveBeenCalled();
+  });
+
+  it('refuses a split change that gives a withdrawal two sources', async () => {
+    mockClient.get = vi.fn().mockResolvedValueOnce(twoSplits());
+    mockClient.put = vi.fn();
+    await expect(
+      updateTransaction(mockClient, '57', { splits: [{ transaction_journal_id: '222', source_id: '7' }] }),
+    ).rejects.toThrow(/share one source account/);
+    expect(mockClient.put).not.toHaveBeenCalled();
+  });
+
+  it('points flat fields on a split group to splits', async () => {
+    mockClient.get = vi.fn().mockResolvedValueOnce(twoSplits());
+    mockClient.put = vi.fn();
+    await expect(updateTransaction(mockClient, '57', { amount: '5.00' })).rejects.toThrow(/or use splits/);
+    expect(mockClient.put).not.toHaveBeenCalled();
+  });
+
+  it('refuses flat per-split fields together with splits, before calling Firefly', async () => {
+    mockClient.get = vi.fn();
+    await expect(
+      updateTransaction(mockClient, '57', { amount: '5.00', splits: [{ transaction_journal_id: '221' }] }),
+    ).rejects.toThrow(/inside splits/);
+    expect(mockClient.get).not.toHaveBeenCalled();
+  });
+
+  it('requires amount and description on a new split', async () => {
+    mockClient.get = vi.fn().mockResolvedValueOnce(plain());
+    await expect(updateTransaction(mockClient, '57', { splits: [{ amount: '1.00' }] })).rejects.toThrow(
+      /needs amount and description/,
+    );
+  });
+
+  it('rejects an unknown or repeated journal id in splits', async () => {
+    mockClient.get = vi.fn().mockResolvedValueOnce(twoSplits());
+    await expect(
+      updateTransaction(mockClient, '57', { splits: [{ transaction_journal_id: '999', amount: '1' }] }),
+    ).rejects.toThrow('Split 999 is not part of transaction group 57');
+    mockClient.get = vi.fn().mockResolvedValueOnce(twoSplits());
+    await expect(
+      updateTransaction(mockClient, '57', {
+        splits: [
+          { transaction_journal_id: '221', amount: '1' },
+          { transaction_journal_id: '221', notes: 'n' },
+        ],
+      }),
+    ).rejects.toThrow(/more than once/);
+  });
+
+  it('unlinks a subscription with bill_id null', async () => {
+    mockClient.get = vi.fn().mockResolvedValueOnce(plain());
+    mockClient.put = vi.fn().mockResolvedValueOnce(writeSingleFixture);
+    await updateTransaction(mockClient, '57', { bill_id: null });
+    expect(vi.mocked(mockClient.put).mock.calls[0][1]).toMatchObject({
+      transactions: [{ transaction_journal_id: '221', bill_id: null }],
+    });
+  });
+
+  it('accepts a group_title-only update on a split group', async () => {
+    mockClient.get = vi.fn().mockResolvedValueOnce(twoSplits());
+    mockClient.put = vi.fn().mockResolvedValueOnce(writeSingleFixture);
+    await updateTransaction(mockClient, '57', { group_title: 'Renamed' });
+    expect(vi.mocked(mockClient.put).mock.calls[0][1]).toMatchObject({
+      group_title: 'Renamed',
+      transactions: [{ transaction_journal_id: '221' }, { transaction_journal_id: '222' }],
+    });
+  });
+});

@@ -1,6 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { type FireflyClient, formatError } from '../client.js';
+import { type FireflyClient, FireflyError, formatError } from '../client.js';
 import {
   type JsonApiListResponse,
   type JsonApiSingleResponse,
@@ -39,6 +39,81 @@ const GROUP_ID_HINT = `update_transaction and delete_transaction take ${GROUP_VS
 const groupIdField = (verb: string): string =>
   `Transaction group ID — ${GROUP_VS_JOURNAL_ID}. That is usually an adjacent number, so the wrong one silently ${verb} a different transaction.`;
 
+const SOURCE_ID_HINT =
+  'Source account ID: an asset account or liability for withdrawals and transfers, a revenue account or liability for deposits.';
+const DESTINATION_ID_HINT =
+  'Destination account ID: an expense account or liability for withdrawals (e.g. a person who owes you, so their balance goes up), an asset account for deposits and transfers. A withdrawal without one lands on Firefly III\'s nameless "(no name)" expense account.';
+
+// Optional fields shared by every transaction write tool, at the top level or per split.
+const splitExtraFields = {
+  bill_id: z
+    .string()
+    .optional()
+    .describe(
+      'Subscription (bill) ID to link this transaction to, so Firefly III shows the subscription as paid. Use get_bills to find valid IDs.',
+    ),
+  external_id: z
+    .string()
+    .min(1)
+    .max(255)
+    .optional()
+    .describe('ID of this transaction in another system. Searchable with `external_id_is:<value>`.'),
+  internal_reference: z
+    .string()
+    .min(1)
+    .max(255)
+    .optional()
+    .describe(
+      'Your own reference, e.g. the bank reference number from an SMS. Search for `internal_reference_is:<value>` with search_transactions before creating, to avoid logging the same charge twice.',
+    ),
+  external_url: z
+    .string()
+    .min(1)
+    .max(255)
+    .optional()
+    .describe('Link to this transaction elsewhere (http or https URL).'),
+};
+
+const writeOptionFields = {
+  apply_rules: z.boolean().optional().describe("Run Firefly III's rules on the result (default true)"),
+  fire_webhooks: z.boolean().optional().describe('Fire Firefly III webhooks for this change (default true)'),
+};
+
+const errorIfDuplicateField = z
+  .boolean()
+  .optional()
+  .describe(
+    'When true, Firefly III refuses a transaction identical to an existing one, and the tool returns `{ "duplicate": true, "created": false, "existing_transaction_id": … }` instead of creating it. Default false. Use it when replaying bank messages that might already be logged.',
+  );
+
+// Per-split fields update_transaction accepts both flat (for one split) and inside each `splits` entry.
+const updatableSplitFields = {
+  source_id: z.string().optional().describe(SOURCE_ID_HINT),
+  destination_id: z.string().optional().describe(DESTINATION_ID_HINT),
+  category_name: z.string().optional().describe(`Category name. ${CATEGORY_NAME_HINT}`),
+  budget_id: z.string().optional().describe('Budget ID'),
+  currency_code: z.string().optional().describe('Currency code (e.g. EUR, USD)'),
+  foreign_amount: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      `${FOREIGN_AMOUNT_HINT} Firefly III enforces this only when creating, so an update missing it is accepted silently: when changing \`amount\` on a transaction that already has a foreign amount, send the new foreign_amount too. On its own it changes the foreign amount of a split that already has a foreign currency. Pass null to remove the foreign amount and its currency.`,
+    ),
+  foreign_currency_code: z
+    .string()
+    .optional()
+    .describe(`${FOREIGN_CURRENCY_CODE_HINT} On update, always send foreign_amount with it, even if unchanged.`),
+  notes: z.string().optional().describe('Additional notes'),
+  tags: z.array(z.string()).optional().describe('Tags (replaces existing tags)'),
+  ...splitExtraFields,
+  bill_id: z
+    .string()
+    .nullable()
+    .optional()
+    .describe('Subscription (bill) ID to link this split to (use get_bills to find IDs). Pass null to unlink it.'),
+};
+
 export async function fetchTransactions(
   client: FireflyClient,
   params: {
@@ -71,52 +146,131 @@ export async function fetchTransaction(client: FireflyClient, id: string): Promi
   return unwrapSingle(response);
 }
 
+type TransactionType = 'withdrawal' | 'deposit' | 'transfer';
+
+/** Group-level flags Firefly III reads on every POST/PUT /transactions. */
+interface WriteOptions {
+  apply_rules?: boolean;
+  fire_webhooks?: boolean;
+}
+
+/** Per-split fields that map 1:1 onto an item of `transactions[]`. */
+interface SplitFields {
+  source_id?: string;
+  destination_id?: string;
+  category_name?: string;
+  budget_id?: string;
+  bill_id?: string | null;
+  currency_code?: string;
+  foreign_amount?: string | null;
+  foreign_currency_code?: string;
+  notes?: string;
+  tags?: string[];
+  external_id?: string;
+  internal_reference?: string;
+  external_url?: string;
+}
+
+function writeOptions(options: WriteOptions & { error_if_duplicate_hash?: boolean }): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    apply_rules: options.apply_rules ?? true,
+    fire_webhooks: options.fire_webhooks ?? true,
+  };
+  if (options.error_if_duplicate_hash !== undefined) body.error_if_duplicate_hash = options.error_if_duplicate_hash;
+  return body;
+}
+
+/** What a create tool returns instead of the new transaction when Firefly III refused a duplicate. */
+export interface DuplicateResult {
+  duplicate: true;
+  created: false;
+  existing_transaction_id: string;
+  message: string;
+}
+
+// With error_if_duplicate_hash, Firefly III answers 422 with "Duplicate of transaction #<group id>."
+// on the first split's description. That is an expected outcome for a caller replaying the same bank
+// message, so it is returned as a result rather than as a generic validation error.
+const DUPLICATE_PATTERN = /Duplicate of transaction #(\d+)/;
+
+async function postTransactionGroup(
+  client: FireflyClient,
+  body: Record<string, unknown>,
+): Promise<UnwrappedSingle | DuplicateResult> {
+  try {
+    const response = await client.post<JsonApiSingleResponse>('/transactions', body);
+    return unwrapSingle(response);
+  } catch (err) {
+    const match = err instanceof FireflyError && err.status === 422 ? DUPLICATE_PATTERN.exec(err.body) : null;
+    if (!match) throw err;
+    return {
+      duplicate: true,
+      created: false,
+      existing_transaction_id: match[1],
+      message: `Not created: Firefly III already has an identical transaction (group ${match[1]}).`,
+    };
+  }
+}
+
+const SHARED_ACCOUNTS: Record<TransactionType, Array<'source_id' | 'destination_id'>> = {
+  withdrawal: ['source_id'],
+  deposit: ['destination_id'],
+  transfer: ['source_id', 'destination_id'],
+};
+
+const SPLIT_ACCOUNT_RULE: Record<TransactionType, string> = {
+  withdrawal:
+    'withdrawal splits share one source account; their destinations (expense accounts or liabilities) may differ',
+  deposit: 'deposit splits share one destination account; their sources (revenue accounts or liabilities) may differ',
+  transfer: 'transfer splits share both the source and the destination account',
+};
+
+/**
+ * Checks Firefly III's split rules before sending anything, so a broken group fails with an
+ * explanation instead of Firefly's "All accounts in this field must be equal." on one field.
+ */
+export function checkSplitAccounts(
+  type: TransactionType,
+  splits: Array<{ source_id?: string | null; destination_id?: string | null }>,
+): void {
+  if (splits.length < 2) return;
+  for (const field of SHARED_ACCOUNTS[type]) {
+    const values = new Set(splits.map((s) => (s[field] == null ? '(not set)' : String(s[field]))));
+    if (values.size > 1) {
+      throw new Error(
+        `Firefly III rule: ${SPLIT_ACCOUNT_RULE[type]}. These splits use different ${field} values: ${[...values].join(', ')}.`,
+      );
+    }
+  }
+}
+
 export async function createTransaction(
   client: FireflyClient,
-  params: {
-    type: 'withdrawal' | 'deposit' | 'transfer';
-    date: string;
-    amount: string;
-    description: string;
-    source_id?: string;
-    destination_id?: string;
-    category_name?: string;
-    budget_id?: string;
-    currency_code?: string;
-    foreign_amount?: string;
-    foreign_currency_code?: string;
-    notes?: string;
-    tags?: string[];
-  },
-): Promise<UnwrappedSingle> {
-  const split: Record<string, unknown> = {
-    type: params.type,
-    date: params.date,
-    amount: params.amount,
-    description: params.description,
-  };
-  if (params.source_id !== undefined) split.source_id = params.source_id;
-  if (params.destination_id !== undefined) split.destination_id = params.destination_id;
-  if (params.category_name !== undefined) split.category_name = params.category_name;
-  if (params.budget_id !== undefined) split.budget_id = params.budget_id;
-  if (params.currency_code !== undefined) split.currency_code = params.currency_code;
-  if (params.foreign_amount !== undefined) split.foreign_amount = params.foreign_amount;
-  if (params.foreign_currency_code !== undefined) split.foreign_currency_code = params.foreign_currency_code;
-  if (params.notes !== undefined) split.notes = params.notes;
-  if (params.tags !== undefined) split.tags = params.tags;
-  const response = await client.post<JsonApiSingleResponse>('/transactions', {
-    apply_rules: true,
-    fire_webhooks: true,
-    transactions: [split],
+  params: WriteOptions &
+    SplitFields & {
+      type: TransactionType;
+      date: string;
+      amount: string;
+      description: string;
+      error_if_duplicate_hash?: boolean;
+    },
+): Promise<UnwrappedSingle | DuplicateResult> {
+  const { apply_rules, fire_webhooks, error_if_duplicate_hash, ...split } = params;
+  return postTransactionGroup(client, {
+    ...writeOptions({ apply_rules, fire_webhooks, error_if_duplicate_hash }),
+    transactions: [definedFields(split)],
   });
-  return unwrapSingle(response);
 }
 
 /** One split (journal) of a transaction group, as returned inside `transactions[]`. */
 interface GroupSplit {
   transaction_journal_id: string;
+  type?: string;
+  date?: string;
   description?: string;
   amount?: string;
+  source_id?: string | null;
+  destination_id?: string | null;
   foreign_currency_code?: string | null;
 }
 
@@ -142,73 +296,52 @@ function definedFields(fields: Record<string, unknown>): Record<string, unknown>
   return Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
 }
 
+interface GroupUpdatePlan extends WriteOptions {
+  /** A type change, applied to every split (Firefly requires one type per group). */
+  type?: unknown;
+  /** Field changes per existing split, keyed by transaction_journal_id. */
+  edits: Map<string, Record<string, unknown>>;
+  /** New splits, sent without a transaction_journal_id. */
+  additions?: Array<Record<string, unknown>>;
+  /** Existing splits to leave out of the request, which makes Firefly delete them. */
+  removed?: Set<string>;
+  groupTitle?: string;
+}
+
 /**
- * Builds a PUT body that changes only the splits in `targets`.
+ * Builds a PUT body that changes only what the plan names.
  *
  * Firefly's GroupUpdateService treats a `transactions[]` entry without `transaction_journal_id` as a
- * brand-new split, and then deletes every existing split the request did not mention. So every split
- * of the group is sent with its ID; the untouched ones carry nothing else, which Firefly skips.
- * Firefly also requires all splits to share one type (a type change applies to every split) and
- * rejects a multi-split update without a group title.
+ * brand-new split, and then deletes every existing split the request did not mention (verified on
+ * 6.7.9). So every split of the group that is not explicitly removed is sent with its ID; the
+ * untouched ones carry nothing else, which Firefly skips. Firefly also requires all splits to share
+ * one type and rejects a multi-split update without a group title.
  */
-function buildGroupUpdate(group: GroupSplits, targets: Set<string>, changes: Record<string, unknown>) {
-  const { type, ...perSplit } = changes;
-  const transactions = group.splits.map((s) => {
+function buildGroupUpdate(group: GroupSplits, plan: GroupUpdatePlan) {
+  const kept = group.splits.filter((s) => !plan.removed?.has(s.transaction_journal_id));
+  const transactions: Array<Record<string, unknown>> = kept.map((s) => {
     const entry: Record<string, unknown> = { transaction_journal_id: s.transaction_journal_id };
-    if (type !== undefined) entry.type = type;
-    if (targets.has(s.transaction_journal_id)) Object.assign(entry, perSplit);
+    if (plan.type !== undefined) entry.type = plan.type;
+    Object.assign(entry, plan.edits.get(s.transaction_journal_id));
     return entry;
   });
-  const body: Record<string, unknown> = { apply_rules: true, fire_webhooks: true, transactions };
-  if (transactions.length > 1) body.group_title = group.title || group.splits[0].description || 'Split transaction';
+  transactions.push(...(plan.additions ?? []));
+  const body: Record<string, unknown> = { ...writeOptions(plan), transactions };
+  if (plan.groupTitle !== undefined) body.group_title = plan.groupTitle;
+  else if (transactions.length > 1) {
+    body.group_title = group.title || kept[0]?.description || group.splits[0].description || 'Split transaction';
+  }
   return body;
 }
 
-export async function updateTransaction(
-  client: FireflyClient,
-  id: string,
-  params: {
-    transaction_journal_id?: string;
-    type?: 'withdrawal' | 'deposit' | 'transfer';
-    date?: string;
-    amount?: string;
-    description?: string;
-    source_id?: string;
-    destination_id?: string;
-    category_name?: string;
-    budget_id?: string;
-    currency_code?: string;
-    foreign_amount?: string | null;
-    foreign_currency_code?: string;
-    notes?: string;
-    tags?: string[];
-  },
-): Promise<UnwrappedSingle> {
-  const { transaction_journal_id: journalId, ...fields } = params;
-  const changes = definedFields(fields);
-  if (Object.keys(changes).length === 0) throw new Error('Nothing to update: pass at least one field to change.');
-
-  const group = await fetchGroupSplits(client, id);
-  let target: string;
-  if (journalId !== undefined) {
-    if (!group.splits.some((s) => s.transaction_journal_id === journalId)) {
-      throw new Error(
-        `Split ${journalId} is not part of transaction group ${id}. Its splits are: ${describeSplits(group.splits)}.`,
-      );
-    }
-    target = journalId;
-  } else if (group.splits.length === 1) {
-    target = group.splits[0].transaction_journal_id;
-  } else {
-    throw new Error(
-      `Transaction group ${id} has ${group.splits.length} splits; pass transaction_journal_id to choose which one to update (one split per call). Splits: ${describeSplits(group.splits)}.`,
-    );
-  }
-
-  // Firefly III checks foreign_amount and foreign_currency_code as a pair only when creating. On
-  // update it answers 200 and stores nothing for a currency without an amount, or for an amount on
-  // a split that has no foreign currency yet; an amount alone does update a split that has one.
-  // It also ignores null; a foreign amount of "0" is what removes the foreign amount and currency.
+/**
+ * Firefly III checks foreign_amount and foreign_currency_code as a pair only when creating. On
+ * update it answers 200 and stores nothing for a currency without an amount, or for an amount on
+ * a split that has no foreign currency yet; an amount alone does update a split that has one.
+ * It also ignores null; a foreign amount of "0" is what removes the foreign amount and currency.
+ * Mutates `changes` to turn a null foreign_amount into "0".
+ */
+function checkForeignChange(changes: Record<string, unknown>, split: GroupSplit): void {
   if (changes.foreign_amount === null) changes.foreign_amount = '0';
   if (changes.foreign_currency_code !== undefined && changes.foreign_amount === undefined) {
     throw new Error(
@@ -216,19 +349,170 @@ export async function updateTransaction(
     );
   }
   const clearsForeign = changes.foreign_amount !== undefined && Number(changes.foreign_amount) === 0;
-  const splitHasForeign = Boolean(group.splits.find((s) => s.transaction_journal_id === target)?.foreign_currency_code);
   if (changes.foreign_amount !== undefined && changes.foreign_currency_code === undefined) {
-    if (!clearsForeign && !splitHasForeign) {
+    if (!clearsForeign && !split.foreign_currency_code) {
       throw new Error(
-        `Split ${target} has no foreign amount yet, so pass foreign_currency_code with foreign_amount: Firefly III ignores a foreign amount without a currency.`,
+        `Split ${split.transaction_journal_id} has no foreign amount yet, so pass foreign_currency_code with foreign_amount: Firefly III ignores a foreign amount without a currency.`,
       );
     }
   }
+}
 
-  const response = await client.put<JsonApiSingleResponse>(
-    `/transactions/${id}`,
-    buildGroupUpdate(group, new Set([target]), changes),
-  );
+/** One entry of update_transaction's `splits`: an edit when it names a journal, otherwise a new split. */
+export interface SplitChange extends SplitFields {
+  transaction_journal_id?: string;
+  amount?: string;
+  description?: string;
+  date?: string;
+}
+
+const isTransactionType = (value: unknown): value is TransactionType =>
+  value === 'withdrawal' || value === 'deposit' || value === 'transfer';
+
+/** Turns update_transaction's `splits` / `remove_journal_ids` into a plan, validating against the stored group. */
+function planSplitChanges(
+  id: string,
+  group: GroupSplits,
+  splits: SplitChange[],
+  removeIds: string[],
+  type: TransactionType | undefined,
+): Pick<GroupUpdatePlan, 'edits' | 'additions' | 'removed'> {
+  const byId = new Map(group.splits.map((s) => [s.transaction_journal_id, s]));
+  const notInGroup = (journalId: string) =>
+    new Error(
+      `Split ${journalId} is not part of transaction group ${id}. Its splits are: ${describeSplits(group.splits)}.`,
+    );
+  const removed = new Set(removeIds);
+  for (const journalId of removed) if (!byId.has(journalId)) throw notInGroup(journalId);
+
+  const edits = new Map<string, Record<string, unknown>>();
+  const newSplits: Array<Record<string, unknown>> = [];
+  for (const { transaction_journal_id: journalId, ...fields } of splits) {
+    const changes = definedFields(fields);
+    if (journalId === undefined) {
+      if (changes.amount === undefined || changes.description === undefined) {
+        throw new Error(
+          'A new split (an entry of splits without transaction_journal_id) needs amount and description.',
+        );
+      }
+      if (changes.foreign_amount === null) delete changes.foreign_amount;
+      if ((changes.foreign_amount === undefined) !== (changes.foreign_currency_code === undefined)) {
+        throw new Error('A new split needs foreign_amount and foreign_currency_code together, or neither.');
+      }
+      newSplits.push(changes);
+      continue;
+    }
+    const split = byId.get(journalId);
+    if (!split) throw notInGroup(journalId);
+    if (removed.has(journalId))
+      throw new Error(`Split ${journalId} is both edited in splits and listed in remove_journal_ids.`);
+    if (edits.has(journalId))
+      throw new Error(`Split ${journalId} appears more than once in splits; merge its changes into one entry.`);
+    checkForeignChange(changes, split);
+    edits.set(journalId, changes);
+  }
+
+  const kept = group.splits.filter((s) => !removed.has(s.transaction_journal_id));
+  if (kept.length + newSplits.length === 0) {
+    throw new Error('This would remove every split of the transaction. Use delete_transaction to delete it instead.');
+  }
+
+  // A new split inherits the group's type, date and shared account(s) unless it sets its own, so
+  // adding "Mody's part" to a withdrawal only needs amount, description and destination_id.
+  const template = kept[0] ?? group.splits[0];
+  const finalType = type ?? (isTransactionType(template.type) ? template.type : undefined);
+  const additions = newSplits.map((changes) => {
+    const entry: Record<string, unknown> = {};
+    if (finalType !== undefined) entry.type = finalType;
+    if (template.date !== undefined) entry.date = template.date;
+    for (const field of finalType ? SHARED_ACCOUNTS[finalType] : []) {
+      if (template[field] != null) entry[field] = template[field];
+    }
+    return Object.assign(entry, changes);
+  });
+
+  if (finalType !== undefined) {
+    checkSplitAccounts(finalType, [
+      ...kept.map((s) => ({
+        source_id: (edits.get(s.transaction_journal_id)?.source_id as string | undefined) ?? s.source_id,
+        destination_id: (edits.get(s.transaction_journal_id)?.destination_id as string | undefined) ?? s.destination_id,
+      })),
+      ...additions.map((a) => ({
+        source_id: a.source_id as string | undefined,
+        destination_id: a.destination_id as string | undefined,
+      })),
+    ]);
+  }
+  return { edits, additions, removed };
+}
+
+export async function updateTransaction(
+  client: FireflyClient,
+  id: string,
+  params: WriteOptions &
+    SplitFields & {
+      transaction_journal_id?: string;
+      type?: TransactionType;
+      date?: string;
+      amount?: string;
+      description?: string;
+      group_title?: string;
+      splits?: SplitChange[];
+      remove_journal_ids?: string[];
+    },
+): Promise<UnwrappedSingle> {
+  const {
+    transaction_journal_id: journalId,
+    type,
+    group_title: groupTitle,
+    splits,
+    remove_journal_ids: removeIds,
+    apply_rules,
+    fire_webhooks,
+    ...fields
+  } = params;
+  const flatChanges = definedFields(fields);
+  const perSplit = splits !== undefined || removeIds !== undefined;
+
+  if (perSplit && (journalId !== undefined || Object.keys(flatChanges).length > 0)) {
+    throw new Error(
+      `When using splits or remove_journal_ids, put per-split fields inside splits (one entry per split) instead of at the top level. Top-level fields that still apply: type, group_title. Got top-level: ${[...(journalId !== undefined ? ['transaction_journal_id'] : []), ...Object.keys(flatChanges)].join(', ')}.`,
+    );
+  }
+  if (!perSplit && Object.keys(flatChanges).length === 0 && type === undefined && groupTitle === undefined) {
+    throw new Error('Nothing to update: pass at least one field to change.');
+  }
+  if (perSplit && (splits ?? []).length === 0 && (removeIds ?? []).length === 0) {
+    throw new Error('Nothing to update: splits and remove_journal_ids are both empty.');
+  }
+
+  const group = await fetchGroupSplits(client, id);
+  const plan: GroupUpdatePlan = { type, groupTitle, apply_rules, fire_webhooks, edits: new Map() };
+
+  if (perSplit) {
+    Object.assign(plan, planSplitChanges(id, group, splits ?? [], removeIds ?? [], type));
+  } else if (Object.keys(flatChanges).length > 0) {
+    let target: string;
+    if (journalId !== undefined) {
+      if (!group.splits.some((s) => s.transaction_journal_id === journalId)) {
+        throw new Error(
+          `Split ${journalId} is not part of transaction group ${id}. Its splits are: ${describeSplits(group.splits)}.`,
+        );
+      }
+      target = journalId;
+    } else if (group.splits.length === 1) {
+      target = group.splits[0].transaction_journal_id;
+    } else {
+      throw new Error(
+        `Transaction group ${id} has ${group.splits.length} splits; pass transaction_journal_id to choose which one to update, or use splits to change several at once. Splits: ${describeSplits(group.splits)}.`,
+      );
+    }
+    const split = group.splits.find((s) => s.transaction_journal_id === target) as GroupSplit;
+    checkForeignChange(flatChanges, split);
+    plan.edits.set(target, flatChanges);
+  }
+
+  const response = await client.put<JsonApiSingleResponse>(`/transactions/${id}`, buildGroupUpdate(group, plan));
   return unwrapSingle(response);
 }
 
@@ -311,7 +595,10 @@ export async function bulkUpdateTransactions(
   for (const [id, splitIds] of matched) {
     try {
       const group = await fetchGroupSplits(client, id);
-      await client.put(`/transactions/${id}`, buildGroupUpdate(group, splitIds, changes));
+      await client.put(
+        `/transactions/${id}`,
+        buildGroupUpdate(group, { edits: new Map([...splitIds].map((journalId) => [journalId, changes])) }),
+      );
       outcome.updated.push({ id, splits: [...splitIds] });
     } catch (err) {
       outcome.failed.push({ id, error: formatError(err) });
@@ -322,50 +609,42 @@ export async function bulkUpdateTransactions(
 
 export async function createSplitTransaction(
   client: FireflyClient,
-  params: {
-    type: 'withdrawal' | 'deposit' | 'transfer';
+  params: WriteOptions & {
+    type: TransactionType;
     date: string;
     source_id?: string;
     destination_id?: string;
     currency_code?: string;
     foreign_currency_code?: string;
-    group_title: string;
-    splits: Array<{
-      amount: string;
-      foreign_amount?: string;
-      description: string;
-      category_name?: string;
-      budget_id?: string;
-      tags?: string[];
-      notes?: string;
-    }>;
+    group_title?: string;
+    error_if_duplicate_hash?: boolean;
+    splits: Array<
+      Omit<SplitFields, 'currency_code' | 'foreign_currency_code' | 'foreign_amount'> & {
+        amount: string;
+        foreign_amount?: string;
+        description: string;
+      }
+    >;
   },
-): Promise<UnwrappedSingle> {
-  const transactions = params.splits.map((split) => {
-    const item: Record<string, unknown> = {
+): Promise<UnwrappedSingle | DuplicateResult> {
+  // Top-level accounts are defaults; a split that sets its own source_id/destination_id wins.
+  const transactions = params.splits.map((split) =>
+    definedFields({
       type: params.type,
       date: params.date,
-      amount: split.amount,
-      description: split.description,
-    };
-    if (params.source_id !== undefined) item.source_id = params.source_id;
-    if (params.destination_id !== undefined) item.destination_id = params.destination_id;
-    if (params.currency_code !== undefined) item.currency_code = params.currency_code;
-    if (params.foreign_currency_code !== undefined) item.foreign_currency_code = params.foreign_currency_code;
-    if (split.foreign_amount !== undefined) item.foreign_amount = split.foreign_amount;
-    if (split.category_name !== undefined) item.category_name = split.category_name;
-    if (split.budget_id !== undefined) item.budget_id = split.budget_id;
-    if (split.tags !== undefined) item.tags = split.tags;
-    if (split.notes !== undefined) item.notes = split.notes;
-    return item;
-  });
-  const response = await client.post<JsonApiSingleResponse>('/transactions', {
-    apply_rules: true,
-    fire_webhooks: true,
-    group_title: params.group_title,
+      currency_code: params.currency_code,
+      foreign_currency_code: params.foreign_currency_code,
+      ...split,
+      source_id: split.source_id ?? params.source_id,
+      destination_id: split.destination_id ?? params.destination_id,
+    }),
+  );
+  checkSplitAccounts(params.type, transactions as Array<{ source_id?: string; destination_id?: string }>);
+  return postTransactionGroup(client, {
+    ...writeOptions(params),
+    group_title: params.group_title ?? params.splits[0].description,
     transactions,
   });
-  return unwrapSingle(response);
 }
 
 export function registerTransactionTools(server: McpServer, client: FireflyClient): void {
@@ -424,14 +703,14 @@ export function registerTransactionTools(server: McpServer, client: FireflyClien
     'create_transaction',
     {
       title: 'Create Transaction',
-      description: `Create a new transaction in Firefly III. Use get_accounts to find source and destination account IDs and their currencies; a transfer between accounts in different currencies also needs foreign_amount and foreign_currency_code. ${GROUP_ID_HINT}`,
+      description: `Create a new transaction in Firefly III. Use get_accounts to find source and destination account IDs and their currencies; a transfer between accounts in different currencies also needs foreign_amount and foreign_currency_code. For a card charge billed in EGP but made in USD, pass amount "912.36" plus foreign_amount "16.99" and foreign_currency_code "USD". Set bill_id to mark a subscription as paid, and internal_reference + error_if_duplicate_hash: true when logging from bank messages. ${GROUP_ID_HINT}`,
       inputSchema: {
         type: z.enum(['withdrawal', 'deposit', 'transfer']).describe('Transaction type'),
         date: dateOrDateTimeSchema.describe('Transaction date (YYYY-MM-DD or RFC 3339 date-time with timezone)'),
         amount: z.string().describe('Amount as a positive number string, e.g. "42.50"'),
         description: z.string().describe('Short description of the transaction'),
-        source_id: z.string().optional().describe('Source account ID (required for withdrawals and transfers)'),
-        destination_id: z.string().optional().describe('Destination account ID (required for deposits and transfers)'),
+        source_id: z.string().optional().describe(`${SOURCE_ID_HINT} Required for withdrawals and transfers.`),
+        destination_id: z.string().optional().describe(`${DESTINATION_ID_HINT} Required for deposits and transfers.`),
         category_name: z.string().optional().describe(`Category name to assign. ${CATEGORY_NAME_HINT}`),
         budget_id: z.string().optional().describe('Budget ID — use get_budgets to find valid IDs'),
         currency_code: z.string().optional().describe('Currency code (e.g. EUR, USD). Defaults to account currency.'),
@@ -439,6 +718,9 @@ export function registerTransactionTools(server: McpServer, client: FireflyClien
         foreign_currency_code: z.string().optional().describe(FOREIGN_CURRENCY_CODE_HINT),
         notes: z.string().optional().describe('Additional notes'),
         tags: z.array(z.string()).optional().describe('Tags to attach'),
+        ...splitExtraFields,
+        error_if_duplicate_hash: errorIfDuplicateField,
+        ...writeOptionFields,
       },
       annotations: WRITE_ANNOTATIONS,
     },
@@ -450,40 +732,56 @@ export function registerTransactionTools(server: McpServer, client: FireflyClien
     'update_transaction',
     {
       title: 'Update Transaction',
-      description:
-        'Update one split of an existing transaction in Firefly III. Only fields provided will be changed; the other splits of a split transaction are left untouched. For a transaction with several splits, pass transaction_journal_id to pick the split (one split per call); a type change always applies to every split. Use get_transaction to confirm the IDs before updating.',
+      description: `Update an existing transaction in Firefly III. Only fields provided are changed; splits you don't mention are always kept as they are. Two ways to call it:
+- Flat fields (amount, category_name, ...) change one split: the only one, or the one named by transaction_journal_id.
+- \`splits\` changes several splits in one call and can add new ones: an entry with transaction_journal_id edits that split, an entry without one adds a split (it inherits the group's type, date and shared account). Add remove_journal_ids to delete specific splits.
+Example — turn a 2000 EGP card charge into "1000 mine + 1000 for Mody": {"id": "57", "group_title": "Amazon order", "splits": [{"transaction_journal_id": "221", "amount": "1000.00"}, {"amount": "1000.00", "description": "Mody's part", "destination_id": "12"}]}.
+type and group_title apply to the whole group. Use get_transaction to confirm the IDs before updating. ${GROUP_ID_HINT}`,
       inputSchema: {
         id: idSchema.describe(groupIdField('updates')),
         transaction_journal_id: z
           .string()
           .optional()
           .describe(
-            "Which split to update: the `transaction_journal_id` from the group's `transactions[]`. Optional when the transaction has a single split; required when it has several.",
+            "Which split the flat fields update: the `transaction_journal_id` from the group's `transactions[]`. Optional when the transaction has a single split; required when it has several (or use splits).",
           ),
-        type: z.enum(['withdrawal', 'deposit', 'transfer']).optional().describe('Transaction type'),
+        type: z
+          .enum(['withdrawal', 'deposit', 'transfer'])
+          .optional()
+          .describe('Transaction type, applied to every split (Firefly III requires one type per group)'),
+        group_title: z.string().min(1).optional().describe('Title for the whole transaction group'),
         date: dateOrDateTimeSchema
           .optional()
           .describe('Transaction date (YYYY-MM-DD or RFC 3339 date-time with timezone)'),
         amount: z.string().optional().describe('Amount as a positive number string'),
         description: z.string().optional().describe('Short description'),
-        source_id: z.string().optional().describe('Source account ID'),
-        destination_id: z.string().optional().describe('Destination account ID'),
-        category_name: z.string().optional().describe(`Category name. ${CATEGORY_NAME_HINT}`),
-        budget_id: z.string().optional().describe('Budget ID'),
-        currency_code: z.string().optional().describe('Currency code (e.g. EUR, USD)'),
-        foreign_amount: z
-          .string()
-          .nullable()
+        ...updatableSplitFields,
+        splits: z
+          .array(
+            z.object({
+              transaction_journal_id: z
+                .string()
+                .optional()
+                .describe(
+                  'The split to edit. Leave it out to add a new split (which then needs amount and description).',
+                ),
+              amount: z.string().optional().describe('Amount as a positive number string'),
+              description: z.string().optional().describe('Description of this split'),
+              date: dateOrDateTimeSchema.optional().describe('Date of this split (YYYY-MM-DD or RFC 3339 date-time)'),
+              ...updatableSplitFields,
+            }),
+          )
           .optional()
           .describe(
-            `${FOREIGN_AMOUNT_HINT} Firefly III enforces this only when creating, so an update missing it is accepted silently: when changing \`amount\` on a transaction that already has a foreign amount, send the new foreign_amount too. On its own it changes the foreign amount of a split that already has a foreign currency. Pass null to remove the foreign amount and its currency.`,
+            'Per-split changes; cannot be combined with the flat per-split fields. Splits not listed here are kept unchanged.',
           ),
-        foreign_currency_code: z
-          .string()
+        remove_journal_ids: z
+          .array(z.string())
           .optional()
-          .describe(`${FOREIGN_CURRENCY_CODE_HINT} On update, always send foreign_amount with it, even if unchanged.`),
-        notes: z.string().optional().describe('Additional notes'),
-        tags: z.array(z.string()).optional().describe('Tags (replaces existing tags)'),
+          .describe(
+            'transaction_journal_ids of splits to delete from the group. Nothing is ever removed unless listed here.',
+          ),
+        ...writeOptionFields,
       },
       annotations: UPDATE_ANNOTATIONS,
     },
@@ -511,7 +809,7 @@ export function registerTransactionTools(server: McpServer, client: FireflyClien
     {
       title: 'Search Transactions',
       description:
-        'Search for transactions in Firefly III by keyword. Searches across descriptions, notes, and other fields.',
+        'Search for transactions in Firefly III by keyword. Searches across descriptions, notes, and other fields. Supports Firefly III search operators, e.g. `internal_reference_is:ABC123` or `external_id_is:sms-42` (check before creating a transaction from a bank message), `bill_is:Spotify`, `category_is:Food`, `date_after:2026-10-01`.',
       inputSchema: {
         query: z.string().describe('Search query'),
         page: z.number().int().positive().optional().default(1).describe('Page number'),
@@ -532,15 +830,22 @@ export function registerTransactionTools(server: McpServer, client: FireflyClien
     'create_split_transaction',
     {
       title: 'Create Split Transaction',
-      description:
-        'Create a split transaction in Firefly III — one receipt divided across multiple categories, budgets, or descriptions. All splits share the same type, date, and accounts. Use get_accounts to find source and destination account IDs.',
+      description: `Create a split transaction in Firefly III: one receipt divided across several categories, budgets, descriptions or accounts. All splits share the type and date. Top-level source_id/destination_id are defaults that a split can override, following Firefly III's rules: withdrawal splits share one source but may go to different destinations (expense accounts or liabilities); deposit splits share one destination but may come from different sources; transfer splits share both. Example — a 2000 EGP card charge where half was bought for someone who owes you: {"type": "withdrawal", "date": "2026-10-23", "source_id": "3", "group_title": "Amazon order", "splits": [{"amount": "1000.00", "description": "My part", "destination_id": "41"}, {"amount": "1000.00", "description": "Mody's part", "destination_id": "12"}]}. Use get_accounts to find account IDs. ${GROUP_ID_HINT}`,
       inputSchema: {
         type: z.enum(['withdrawal', 'deposit', 'transfer']).describe('Transaction type (shared across all splits)'),
         date: dateOrDateTimeSchema.describe(
           'Transaction date (YYYY-MM-DD or RFC 3339 date-time with timezone, shared across all splits)',
         ),
-        source_id: z.string().optional().describe('Source account ID (required for withdrawals and transfers)'),
-        destination_id: z.string().optional().describe('Destination account ID (required for deposits and transfers)'),
+        source_id: z
+          .string()
+          .optional()
+          .describe(
+            `Default source account for every split. ${SOURCE_ID_HINT} Required for withdrawals and transfers.`,
+          ),
+        destination_id: z
+          .string()
+          .optional()
+          .describe(`Default destination account for every split. ${DESTINATION_ID_HINT}`),
         currency_code: z.string().optional().describe('Currency code (e.g. EUR, USD). Defaults to account currency.'),
         foreign_currency_code: z
           .string()
@@ -549,21 +854,32 @@ export function registerTransactionTools(server: McpServer, client: FireflyClien
         group_title: z
           .string()
           .min(1)
-          .describe('Title for the whole transaction group (Firefly III requires one when there are several splits)'),
+          .optional()
+          .describe(
+            "Title for the whole transaction group (Firefly III requires one when there are several splits). Defaults to the first split's description.",
+          ),
         splits: z
           .array(
             z.object({
               amount: z.string().describe('Amount as a positive number string, e.g. "42.50"'),
               foreign_amount: z.string().optional().describe(`Foreign amount for this split. ${FOREIGN_AMOUNT_HINT}`),
               description: z.string().describe('Description for this split'),
+              source_id: z.string().optional().describe('Source account for this split (overrides the top-level one)'),
+              destination_id: z
+                .string()
+                .optional()
+                .describe('Destination account for this split (overrides the top-level one)'),
               category_name: z.string().optional().describe(`Category name. ${CATEGORY_NAME_HINT}`),
               budget_id: z.string().optional().describe('Budget ID — use get_budgets to find valid IDs'),
               tags: z.array(z.string()).optional().describe('Tags'),
               notes: z.string().optional().describe('Notes'),
+              ...splitExtraFields,
             }),
           )
           .min(2)
           .describe('At least 2 splits required'),
+        error_if_duplicate_hash: errorIfDuplicateField,
+        ...writeOptionFields,
       },
       annotations: WRITE_ANNOTATIONS,
     },
