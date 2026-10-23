@@ -291,3 +291,33 @@ describe('handler smoke — recurring', () => {
     expect(result).toMatchObject({ isError: true });
   });
 });
+
+describe('recurrence end conditions', () => {
+  const base = {
+    type: 'transfer' as const,
+    title: 'Principal back',
+    first_date: '2029-08-15',
+    repeat_type: 'yearly' as const,
+    repeat_moment: '2029-08-15',
+    amount: '300000',
+    transaction_description: 'Principal back',
+    source_id: '7',
+    destination_id: '1',
+  };
+
+  it('sends nr_of_repetitions without repeat_until, which Firefly III would count as a second end condition', async () => {
+    mockClient.post = vi.fn().mockResolvedValueOnce({ data: { id: '1', type: 'recurrences', attributes: {} } });
+    await createRecurrence(mockClient, { ...base, nr_of_repetitions: 1 });
+    const body = vi.mocked(mockClient.post).mock.calls[0][1] as Record<string, unknown>;
+    expect(body.nr_of_repetitions).toBe(1);
+    expect(body).not.toHaveProperty('repeat_until');
+  });
+
+  it('refuses both end conditions', async () => {
+    mockClient.post = vi.fn();
+    await expect(
+      createRecurrence(mockClient, { ...base, nr_of_repetitions: 1, repeat_until: '2030-01-01' }),
+    ).rejects.toThrow(/not both/);
+    expect(mockClient.post).not.toHaveBeenCalled();
+  });
+});

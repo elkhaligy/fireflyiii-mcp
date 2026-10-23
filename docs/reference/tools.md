@@ -8,8 +8,8 @@
 |------|-------------|
 | `get_accounts` | List all accounts, filterable by type |
 | `get_account` | Get a single account by ID with current balance |
-| `create_account` | Create a new account |
-| `update_account` | Update an existing account |
+| `create_account` | Create a new account, including `account_number`, `virtual_balance` and credit card settings (`credit_card_type` + `monthly_payment_date` for `ccAsset`) |
+| `update_account` | Update an existing account, including its `account_role`, `account_number`, `virtual_balance` and credit card settings |
 | `delete_account` | Delete an account. This action cannot be undone. |
 | `get_account_transactions` | Get all transactions for a specific account, filterable by type and date range |
 | `search_accounts` | Search accounts by name, IBAN, or account number |
@@ -21,9 +21,9 @@
 | `get_transactions` | List transactions with filters (account, date, type) |
 | `get_transaction` | Get a single transaction by ID with all splits |
 | `search_transactions` | Keyword search across transactions |
-| `create_transaction` | Create a new transaction, including transfers between accounts in different currencies (`foreign_amount` + `foreign_currency_code`) |
-| `create_split_transaction` | Create a split transaction (one receipt across multiple categories/budgets); requires a group title; supports a shared `foreign_currency_code` with a `foreign_amount` per split |
-| `update_transaction` | Update one split of a transaction, including its foreign amount and currency (`foreign_amount: null` removes them); the other splits are left untouched (pass `transaction_journal_id` for split transactions) |
+| `create_transaction` | Create a new transaction, including transfers between accounts in different currencies (`foreign_amount` + `foreign_currency_code`); links a subscription with `bill_id`, stores `external_id` / `internal_reference` / `external_url`, and returns a `duplicate` result instead of a copy with `error_if_duplicate_hash` |
+| `create_split_transaction` | Create a split transaction (one receipt across multiple categories, budgets or accounts); top-level `source_id` / `destination_id` are defaults each split can override, checked against Firefly III's split rules; the group title defaults to the first split's description; supports a shared `foreign_currency_code` with a `foreign_amount` per split, `bill_id` and reference fields per split, and `error_if_duplicate_hash` |
+| `update_transaction` | Update one split of a transaction with flat fields (pass `transaction_journal_id` for split transactions), or several at once with `splits`, which can also add new splits; `remove_journal_ids` deletes specific splits and no other split is ever removed. Foreign amount and currency (`foreign_amount: null` removes them), `bill_id` (`null` unlinks) and reference fields |
 | `bulk_update_transactions` | Set category, budget, tags or notes on every transaction a search query matches (only the matching splits; refuses above `max_transactions`) |
 | `delete_transaction` | Delete a transaction. This action cannot be undone. |
 
@@ -80,7 +80,7 @@
 |------|-------------|
 | `get_recurring` | List all recurring transaction rules |
 | `get_recurrence` | Get a single recurring transaction rule by ID |
-| `create_recurring` | Create a new recurring transaction rule, optionally in a foreign currency (`foreign_amount` + `foreign_currency_code`) |
+| `create_recurring` | Create a new recurring transaction rule, optionally in a foreign currency (`foreign_amount` + `foreign_currency_code`); ends at `repeat_until` or after `nr_of_repetitions` |
 | `update_recurring` | Update an existing recurring transaction rule; `foreign_amount` and `foreign_currency_code` are sent together |
 | `delete_recurring` | Delete a recurring transaction rule. This action cannot be undone. |
 | `get_recurrence_transactions` | Get transactions created by a recurring transaction rule |

@@ -22,12 +22,21 @@ import {
   bulkUpdateTransactions,
   createSplitTransaction,
   createTransaction,
+  type DuplicateResult,
   deleteTransaction,
   fetchTransaction,
   fetchTransactions,
   updateTransaction,
 } from '../tools/transactions.js';
+import type { UnwrappedSingle } from '../transform.js';
 import { createMockServer } from './_helpers.js';
+
+/** Narrows a create result to the new transaction; these tests never ask for duplicate detection. */
+async function created(pending: Promise<UnwrappedSingle | DuplicateResult>): Promise<UnwrappedSingle> {
+  const result = await pending;
+  if (result.duplicate === true) throw new Error((result as DuplicateResult).message);
+  return result as UnwrappedSingle;
+}
 
 const SKIP = !process.env.FIREFLY_INTEGRATION;
 
@@ -230,14 +239,16 @@ describe.skipIf(SKIP)('Integration: Firefly III live connection', () => {
     });
 
     it('can create a withdrawal transaction', async () => {
-      const result = await createTransaction(client, {
-        type: 'withdrawal',
-        date: today,
-        amount: '42.00',
-        description: 'CI Integration Test Transaction',
-        source_id: assetAccountId,
-        currency_code: 'EUR',
-      });
+      const result = await created(
+        createTransaction(client, {
+          type: 'withdrawal',
+          date: today,
+          amount: '42.00',
+          description: 'CI Integration Test Transaction',
+          source_id: assetAccountId,
+          currency_code: 'EUR',
+        }),
+      );
       expect(result).toHaveProperty('id');
       expect(result).not.toHaveProperty('attributes');
       transactionId = result.id as string;
@@ -296,18 +307,20 @@ describe.skipIf(SKIP)('Integration: Firefly III live connection', () => {
     });
 
     const splitGroup = (title: string, a: string, b: string) =>
-      createSplitTransaction(client, {
-        type: 'withdrawal',
-        date: today,
-        source_id: accounts.checking,
-        destination_id: accounts.shop,
-        currency_code: 'EUR',
-        group_title: `${run} ${title}`,
-        splits: [
-          { amount: '10', description: a },
-          { amount: '20', description: b },
-        ],
-      });
+      created(
+        createSplitTransaction(client, {
+          type: 'withdrawal',
+          date: today,
+          source_id: accounts.checking,
+          destination_id: accounts.shop,
+          currency_code: 'EUR',
+          group_title: `${run} ${title}`,
+          splits: [
+            { amount: '10', description: a },
+            { amount: '20', description: b },
+          ],
+        }),
+      );
 
     it('update_transaction changes one split of a split transaction and keeps the other', async () => {
       const group = await splitGroup('update', `${run} split A`, `${run} split B`);
@@ -491,15 +504,17 @@ describe.skipIf(SKIP)('Integration: Firefly III live connection', () => {
     // A EUR card payment to a shop that charged USD: Firefly III does not require the foreign side
     // here, so nothing on its end catches a half-filled pair.
     const cardPayment = (foreign: { foreign_amount?: string; foreign_currency_code?: string } = {}) =>
-      createTransaction(client, {
-        type: 'withdrawal',
-        date: today,
-        amount: '18.00',
-        description: `${run} card payment`,
-        source_id: accounts.checking,
-        destination_id: accounts.shop,
-        ...foreign,
-      });
+      created(
+        createTransaction(client, {
+          type: 'withdrawal',
+          date: today,
+          amount: '18.00',
+          description: `${run} card payment`,
+          source_id: accounts.checking,
+          destination_id: accounts.shop,
+          ...foreign,
+        }),
+      );
 
     it('update_transaction refuses a half-filled foreign pair that Firefly III would silently ignore', async () => {
       const tx = await cardPayment();

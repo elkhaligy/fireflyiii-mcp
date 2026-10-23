@@ -73,6 +73,15 @@ const response = {
   meta: { pagination: { current_page: 1, total_pages: 1, total: 1 } },
 };
 
+// Optional inputs a tool refuses in combination with other sampled fields (update_transaction's
+// splits replace its flat per-split fields; nr_of_repetitions excludes repeat_until), so the sampler
+// leaves them out.
+const EXCLUSIVE_OPTIONALS: Record<string, string[]> = {
+  update_transaction: ['splits', 'remove_journal_ids'],
+  create_recurring: ['nr_of_repetitions'],
+  update_recurring: ['nr_of_repetitions'],
+};
+
 type Call = { tool: string; method: string; path: string };
 
 /** Registers every tool against a recording client and calls each handler once, in sequence. */
@@ -98,7 +107,13 @@ async function recordAllToolCalls(): Promise<{ calls: Call[]; tools: string[] }>
   for (const [name, handler] of handlers) {
     tool = name;
     const shape = (toolConfigs.get(name) as { inputSchema?: Record<string, z.ZodType> }).inputSchema ?? {};
-    await handler(Object.fromEntries(Object.entries(shape).map(([key, value]) => [key, sample(value)])));
+    await handler(
+      Object.fromEntries(
+        Object.entries(shape)
+          .filter(([key]) => !EXCLUSIVE_OPTIONALS[name]?.includes(key))
+          .map(([key, value]) => [key, sample(value)]),
+      ),
+    );
   }
   return { calls, tools: [...handlers.keys()] };
 }

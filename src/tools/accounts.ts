@@ -46,6 +46,35 @@ const CREATE_INTEREST_PERIODS = ['daily', 'weekly', 'monthly', 'quarterly', 'hal
 const UPDATE_INTEREST_PERIODS = ['daily', 'monthly', 'yearly'] as const;
 
 const LIABILITY_TYPES = ['loan', 'debt', 'mortgage'] as const;
+
+const ACCOUNT_ROLES = ['defaultAsset', 'sharedAsset', 'savingAsset', 'ccAsset', 'cashWalletAsset'] as const;
+
+// Asset-account fields create_account and update_account share. Firefly III requires
+// credit_card_type and monthly_payment_date whenever account_role is ccAsset, on create and on
+// update alike, and `monthlyFull` is the only credit card type it knows.
+// Accounts have no object group in Firefly III (v6.7.9 ignores object_group_title on them), so
+// unlike bills and piggy banks there is no group field here.
+const assetFields = {
+  account_number: z
+    .string()
+    .min(1)
+    .max(255)
+    .optional()
+    .describe('Account or card number, e.g. the last 4 digits. Must be unique per account type.'),
+  virtual_balance: z
+    .string()
+    .optional()
+    .describe('Virtual balance as a number string, added to the real balance (e.g. a credit card limit)'),
+  credit_card_type: z
+    .enum(['monthlyFull'])
+    .optional()
+    .describe('Credit card payment type. Required (with monthly_payment_date) when account_role is ccAsset.'),
+  monthly_payment_date: dateSchema
+    .optional()
+    .describe(
+      'Date of the first monthly credit card payment (YYYY-MM-DD); Firefly III repeats its day of month. Required when account_role is ccAsset.',
+    ),
+};
 const LIABILITY_DIRECTIONS = ['credit', 'debit'] as const;
 
 // create_account's liability fields are conditional on `type: 'liability'` (a field update_account
@@ -96,7 +125,12 @@ export async function createAccount(
   params: {
     name: string;
     type: 'asset' | 'expense' | 'revenue' | 'liability';
-    account_role?: 'defaultAsset' | 'sharedAsset' | 'savingAsset' | 'ccAsset' | 'cashWalletAsset';
+    account_role?: (typeof ACCOUNT_ROLES)[number];
+    account_number?: string;
+    virtual_balance?: string;
+    credit_card_type?: 'monthlyFull';
+    monthly_payment_date?: string;
+    active?: boolean;
     liability_type?: (typeof LIABILITY_TYPES)[number];
     liability_direction?: (typeof LIABILITY_DIRECTIONS)[number];
     liability_amount?: string;
@@ -127,6 +161,11 @@ export async function updateAccount(
     include_net_worth?: boolean;
     active?: boolean;
     notes?: string;
+    account_role?: (typeof ACCOUNT_ROLES)[number];
+    account_number?: string;
+    virtual_balance?: string;
+    credit_card_type?: 'monthlyFull';
+    monthly_payment_date?: string;
     liability_type?: (typeof LIABILITY_TYPES)[number];
     liability_direction?: (typeof LIABILITY_DIRECTIONS)[number];
     liability_amount?: string;
@@ -238,14 +277,17 @@ export function registerAccountTools(server: McpServer, client: FireflyClient): 
     'create_account',
     {
       title: 'Create Account',
-      description: 'Create a new account in Firefly III.',
+      description:
+        'Create a new account in Firefly III. For a credit card, use type asset with account_role ccAsset, credit_card_type monthlyFull and monthly_payment_date; for a savings certificate, account_role savingAsset. Example: {"name": "NBE Cert A", "type": "asset", "account_role": "savingAsset", "account_number": "1234", "currency_code": "EGP"}.',
       inputSchema: {
         name: z.string().describe('Account name'),
         type: z.enum(['asset', 'expense', 'revenue', 'liability']).describe('Account type'),
         account_role: z
-          .enum(['defaultAsset', 'sharedAsset', 'savingAsset', 'ccAsset', 'cashWalletAsset'])
+          .enum(ACCOUNT_ROLES)
           .optional()
           .describe('Role for asset accounts (required when type is asset)'),
+        ...assetFields,
+        active: z.boolean().optional().describe('Whether the account is active (default true)'),
         ...liabilityFields('create'),
         currency_code: z.string().optional().describe('Currency code (e.g. EUR, USD)'),
         iban: z.string().optional().describe('IBAN number'),
@@ -265,7 +307,7 @@ export function registerAccountTools(server: McpServer, client: FireflyClient): 
     {
       title: 'Update Account',
       description:
-        'Update an existing account in Firefly III. Only fields provided will be changed. Use get_account to confirm the ID.',
+        'Update an existing account in Firefly III. Only fields provided will be changed. Use get_account to confirm the ID. Changing account_role to ccAsset also needs credit_card_type and monthly_payment_date in the same call.',
       inputSchema: {
         id: accountIdSchema,
         name: z.string().optional().describe('Account name'),
@@ -276,6 +318,8 @@ export function registerAccountTools(server: McpServer, client: FireflyClient): 
         include_net_worth: z.boolean().optional().describe('Include in net worth calculations'),
         active: z.boolean().optional().describe('Whether the account is active'),
         notes: z.string().optional().describe('Notes'),
+        account_role: z.enum(ACCOUNT_ROLES).optional().describe('Role, for asset accounts'),
+        ...assetFields,
         ...liabilityFields('update'),
       },
       annotations: UPDATE_ANNOTATIONS,
